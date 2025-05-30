@@ -1,0 +1,151 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*' # Triggers on version tags like v1.0.0, v2.1.0, etc.
+
+permissions:
+  contents: write # Required for creating releases
+  id-token: write # Required for GitHub Actions to access the repository
+  packages: write # Required for uploading release assets
+  issues: write # Optional, if you want to create issues for failed builds
+  pull-requests: write # Optional, if you want to create PRs for failed builds
+  checks: write # Required for updating checks on the commit
+  statuses: write # Required for updating commit statuses
+  
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0 # Fetch all history for proper version info
+    
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21' # Adjust to your Go version
+        check-latest: true
+    
+    - name: Get dependencies
+      run: go mod download
+    
+    - name: Run tests
+      run: go test -v ./...
+    
+    - name: Extract tag name
+      id: tag
+      run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+    
+    - name: Build binaries
+      run: |
+        # Create dist directory
+        mkdir -p dist
+        
+        # Define build targets (OS/ARCH combinations)
+        targets=(
+          "linux/amd64"
+          "linux/arm64"
+          "windows/amd64"
+          "windows/arm64"
+        )
+        
+        # Set the application name
+        APP_NAME="go-http-bench"
+        
+        for target in "${targets[@]}"; do
+          OS=$(echo $target | cut -d'/' -f1)
+          ARCH=$(echo $target | cut -d'/' -f2)
+          
+          # Set binary name with OS-specific extension
+          BINARY_NAME="${APP_NAME}-${OS}-${ARCH}"
+          if [ "$OS" = "windows" ]; then
+            BINARY_NAME="${BINARY_NAME}.exe"
+          fi
+          
+          echo "Building for $OS/$ARCH..."
+
+          # Build the binary
+          CGO_ENABLED=0 GOOS=$OS GOARCH=$ARCH go build \
+            -ldflags="-s -w -X 'main.version=${{ steps.tag.outputs.tag }}' " \
+            -o "dist/${BINARY_NAME}" \
+            ./
+          
+          # Create compressed archive
+          if [ "$OS" = "windows" ]; then
+            zip -j "dist/${APP_NAME}-${OS}-${ARCH}.zip" "dist/${BINARY_NAME}"
+          else
+            tar -czf "dist/${APP_NAME}-${OS}-${ARCH}.tar.gz" -C dist "${BINARY_NAME}"
+          fi
+        done
+    
+    - name: Generate changelog
+      id: changelog
+      run: |
+        # Get the previous tag
+        PREV_TAG=$(git tag --sort=-version:refname | sed -n '2p')
+        
+        if [ -z "$PREV_TAG" ]; then
+          echo "changelog=Initial release" >> $GITHUB_OUTPUT
+        else
+          # Generate changelog from commits between tags
+          CHANGELOG=$(git log --pretty=format:"- %s (%h)" $PREV_TAG..${{ steps.tag.outputs.tag }})
+          # Escape newlines for GitHub output
+          CHANGELOG="${CHANGELOG//'%'/'%25'}"
+          CHANGELOG="${CHANGELOG//$'\n'/'%0A'}"
+          CHANGELOG="${CHANGELOG//$'\r'/'%0D'}"
+          echo "changelog=$CHANGELOG" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.tag }}
+        release_name: Release ${{ steps.tag.outputs.tag }}
+        body: |
+          ## Changes
+          ${{ steps.changelog.outputs.changelog }}
+          
+          ## Downloads
+          Download the appropriate binary for your platform below.
+          
+          ### Checksums
+          See the checksums file for SHA256 hashes of all binaries.
+        draft: false
+        prerelease: ${{ contains(steps.tag.outputs.tag, '-') }} # Mark as prerelease if tag contains hyphen (e.g., v1.0.0-beta)
+    
+    - name: Generate checksums
+      run: |
+        cd dist
+        sha256sum *.tar.gz *.zip > checksums.txt
+    
+    - name: Upload Release Assets
+      run: |
+        # Upload all archives and checksums
+        for file in dist/*.tar.gz dist/*.zip dist/checksums.txt; do
+          echo "Uploading $file..."
+          gh release upload ${{ steps.tag.outputs.tag }} "$file"
+        done
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    # Optional: Build and push Docker image if you have a Dockerfile
+    # - name: Build and push Docker image
+    #   if: hashFiles('Dockerfile') != ''
+    #   run: |
+    #     # Login to GitHub Container Registry
+    #     echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+        
+    #     # Build and tag image
+    #     IMAGE_NAME="ghcr.io/${{ github.repository_owner }}/$(basename ${{ github.repository }})"
+    #     docker build -t $IMAGE_NAME:${{ steps.tag.outputs.tag }} -t $IMAGE_NAME:latest .
+        
+    #     # Push images
+    #     docker push $IMAGE_NAME:${{ steps.tag.outputs.tag }}
+    #     docker push $IMAGE_NAME:latest

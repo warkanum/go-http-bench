@@ -1,0 +1,13 @@
+{
+    "url": "https://api.example.com/upload",
+    "method": "POST",
+    "total_requests": 100,
+    "parallel_count": 10,
+    "timeout": "60s",
+    "content_type": "application/json",
+    "post_data_file": "post_data.json",
+    "headers": {
+        "Authorization": "Bearer your-token",
+        "X-Request-Source": "benchmark-[thread_number]"
+    }
+}

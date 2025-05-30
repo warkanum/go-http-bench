@@ -1,0 +1,17 @@
+{
+    "url": "https://api.example.com/users",
+    "method": "GET",
+    "total_requests": 1000,
+    "parallel_count": 50,
+    "timeout": "30s",
+    "auth_token": "your-bearer-token-here",
+    "headers": {
+        "Accept": "application/json",
+        "X-Request-ID": "bench-[test_number]-[thread_number]"
+    },
+    "parameters": {
+        "page": "[test_number]",
+        "limit": "10",
+        "source": "thread-[thread_number]"
+    }
+}

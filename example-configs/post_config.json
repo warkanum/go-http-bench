@@ -1,0 +1,14 @@
+{
+    "url": "https://api.example.com/data",
+    "method": "POST",
+    "total_requests": 500,
+    "parallel_count": 20,
+    "timeout": "45s",
+    "content_type": "application/json",
+    "headers": {
+        "Accept": "application/json",
+        "X-Test-Number": "[test_number]",
+        "X-Thread-ID": "[thread_number]"
+    },
+    "post_data": "{\"id\": [test_number], \"thread\": [thread_number], \"timestamp\": \"2025-01-01T00:00:00Z\", \"data\": \"test-data-[test_number]\"}"
+}

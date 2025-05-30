@@ -1,0 +1,19 @@
+{
+    "url": "http://127.0.0.1:4968/api/public/v_webui_clients",
+    "method": "GET",
+    "total_requests": 10000,
+    "parallel_count": 50,
+    "timeout": "30s",
+    "auth_token": "Token 0D32A927-4E09-408B-BE86-4A429E96315A",
+    "dump_failures_dir": "./failures",
+    "headers": {
+        "Accept": "application/json",
+        "X-Request-ID": "bench-[test_number]-[thread_number]",
+        "x-custom-sql-w-test": "((tcli.clientstatus = 0 or tcli.clientstatus is null) and (tcli.inactive = 0 or tcli.inactive is null)    and ((tcli.hyphendeactivate = 0 or tcli.hyphendeactivate is null)) and (tcli.inactiveatpda = 0 or tcli.inactiveatpda is null)    and (tcli.pdainactive = 0 or tcli.pdainactive is null) and nv(tcli.approved) <> 6 and nv(tcli.status) <> 5 and not (nv(tcli.approved) < 2 and tcli.status = 3))"
+    },
+    "parameters": {
+        "page": "[test_number]",
+        "limit": "10",
+        "offset": "10[thread_number]"
+    }
+}

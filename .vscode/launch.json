@@ -1,0 +1,36 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run Benchmark For: ",
+            "type": "go",
+            "request": "launch",
+            "windows": {
+                "output": "${workspaceFolder}/bin/go-http-bench.exe"
+            },
+            "output": "${workspaceFolder}/bin/go-http-bench",
+            "cwd": "${workspaceFolder}/bin",
+            "mode": "debug",
+            "program": "${workspaceFolder}",
+            "args": [
+                "-config",
+                "${workspaceFolder}/example-configs/${input:configfile}",          
+            ],
+            "showLog": true
+        }
+    ],
+    "inputs": [
+        {
+            "id": "configfile",
+            "type": "pickString",
+            "default": "config.json",
+            "options": [
+                "config.json",
+                "file_post_config.json",
+                "post_config.json",
+                "post_data.json",
+            ],
+            "description": "Select an Config File"
+        }
+    ]
+}

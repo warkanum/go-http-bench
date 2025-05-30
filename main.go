@@ -2,24 +2,36 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 type BenchmarkConfig struct {
-	URL           string
-	AuthToken     string
-	TotalRequests int
-	ParallelCount int
-	Timeout       time.Duration
-	Headers       map[string]string
-	Parameters    map[string]string
+	URL             string            `json:"url"`
+	Method          string            `json:"method"` // GET, POST, PUT, etc.
+	AuthToken       string            `json:"auth_token"`
+	TotalRequests   int               `json:"total_requests"`
+	ParallelCount   int               `json:"parallel_count"`
+	Timeout         time.Duration     `json:"-"`       // Not directly unmarshaled
+	TimeoutStr      string            `json:"timeout"` // String representation for JSON
+	Headers         map[string]string `json:"headers"`
+	Parameters      map[string]string `json:"parameters"`
+	PostDataFile    string            `json:"post_data_file"`    // File containing POST data
+	PostData        string            `json:"post_data"`         // Direct POST data
+	ContentType     string            `json:"content_type"`      // Content-Type for POST requests
+	DumpFailuresDir string            `json:"dump_failures_dir"` // Directory to dump failure responses
 }
 
 type BenchmarkResult struct {
@@ -34,36 +46,216 @@ type BenchmarkResult struct {
 	ResponseTimes   []time.Duration
 }
 
+type RequestResult struct {
+	Success      bool
+	ResponseTime time.Duration
+	StatusCode   int
+	Error        error
+	ResponseBody string // Added to capture response body for failures
+}
+
+type FailureDumper struct {
+	enabled      bool
+	dumpDir      string
+	seenHashes   map[string]bool
+	mutex        sync.Mutex
+	failureCount int
+}
+
+func NewFailureDumper(dumpDir string) *FailureDumper {
+	if dumpDir == "" {
+		return &FailureDumper{enabled: false}
+	}
+
+	// Create dump directory if it doesn't exist
+	if err := os.MkdirAll(dumpDir, 0755); err != nil {
+		fmt.Printf("Warning: Could not create dump directory %s: %v\n", dumpDir, err)
+		return &FailureDumper{enabled: false}
+	}
+
+	return &FailureDumper{
+		enabled:    true,
+		dumpDir:    dumpDir,
+		seenHashes: make(map[string]bool),
+	}
+}
+
+func (fd *FailureDumper) DumpFailure(statusCode int, responseBody, errorMsg string) {
+	if !fd.enabled {
+		return
+	}
+
+	// Create a unique identifier for this failure type
+	failureContent := fmt.Sprintf("Status: %d\nError: %s\nResponse: %s", statusCode, errorMsg, responseBody)
+	hash := md5.Sum([]byte(failureContent))
+	hashStr := hex.EncodeToString(hash[:])
+
+	fd.mutex.Lock()
+	defer fd.mutex.Unlock()
+
+	// Check if we've already seen this failure type
+	if fd.seenHashes[hashStr] {
+		return
+	}
+
+	// Mark this failure type as seen
+	fd.seenHashes[hashStr] = true
+	fd.failureCount++
+
+	// Create filename with timestamp and failure number
+	timestamp := time.Now().Format("20060102_150405")
+	filename := fmt.Sprintf("failure_%d_%s_status_%d.txt", fd.failureCount, timestamp, statusCode)
+	filepath := filepath.Join(fd.dumpDir, filename)
+
+	// Prepare failure details
+	failureDetails := fmt.Sprintf(`HTTP Benchmark Failure Report
+Generated: %s
+Hash: %s
+
+Status Code: %d
+Error Message: %s
+
+Response Headers: (captured in request)
+Response Body:
+%s
+
+----------------------------------------
+This is a unique failure response that hasn't been seen before in this benchmark run.
+`, time.Now().Format("2006-01-02 15:04:05"), hashStr, statusCode, errorMsg, responseBody)
+
+	// Write to file
+	if err := os.WriteFile(filepath, []byte(failureDetails), 0644); err != nil {
+		fmt.Printf("Warning: Could not write failure dump to %s: %v\n", filepath, err)
+	}
+}
+
 func main() {
 	var config BenchmarkConfig
-	var headersFlag, paramsFlag string
+	var headersFlag, paramsFlag, configFile string
 
-	flag.StringVar(&config.URL, "url", "", "Target URL to benchmark (required)")
+	// Command line flags (for backward compatibility)
+	flag.StringVar(&configFile, "config", "", "Configuration file (JSON format)")
+	flag.StringVar(&config.URL, "url", "", "Target URL to benchmark")
+	flag.StringVar(&config.Method, "method", "GET", "HTTP method (GET, POST, PUT, etc.)")
 	flag.StringVar(&config.AuthToken, "token", "", "Authorization token (Bearer token)")
 	flag.IntVar(&config.TotalRequests, "total", 100, "Total number of requests to make")
 	flag.IntVar(&config.ParallelCount, "parallel", 10, "Number of parallel requests")
 	flag.DurationVar(&config.Timeout, "timeout", 30*time.Second, "Request timeout")
 	flag.StringVar(&headersFlag, "headers", "", "Custom headers (format: 'key1:value1,key2:value2')")
 	flag.StringVar(&paramsFlag, "params", "", "Query parameters (format: 'key1=value1,key2=value2')")
+	flag.StringVar(&config.DumpFailuresDir, "dump-failures", "", "Directory to dump failure responses (only unique failures)")
+	flag.StringVar(&config.PostDataFile, "post-file", "", "File containing POST data")
+	flag.StringVar(&config.PostData, "post-data", "", "POST data as string")
+	flag.StringVar(&config.ContentType, "content-type", "application/json", "Content-Type for POST requests")
 	flag.Parse()
 
+	// Load config from file if specified
+	if configFile != "" {
+		fileConfig, err := loadConfigFromFile(configFile)
+		if err != nil {
+			fmt.Printf("Error loading config file: %v\n", err)
+			return
+		}
+		config = fileConfig
+	}
+
+	// Command line flags override config file values
+	if headersFlag != "" {
+		if config.Headers == nil {
+			config.Headers = make(map[string]string)
+		}
+		headersParsed := parseKeyValuePairs(headersFlag, ":")
+		for k, v := range headersParsed {
+			config.Headers[k] = v
+		}
+	}
+
+	if paramsFlag != "" {
+		if config.Parameters == nil {
+			config.Parameters = make(map[string]string)
+		}
+		paramsParsed := parseKeyValuePairs(paramsFlag, "=")
+		for k, v := range paramsParsed {
+			config.Parameters[k] = v
+		}
+	}
+
+	// Validate required fields
 	if config.URL == "" {
-		fmt.Println("Error: URL is required")
+		fmt.Println("Error: URL is required (use -url flag or config file)")
 		flag.Usage()
 		return
 	}
 
-	// Parse headers
-	config.Headers = parseKeyValuePairs(headersFlag, ":")
+	// Set defaults
+	if config.Method == "" {
+		config.Method = "GET"
+	}
+	if config.TotalRequests == 0 {
+		config.TotalRequests = 100
+	}
+	if config.ParallelCount == 0 {
+		config.ParallelCount = 10
+	}
+	if config.Timeout == 0 {
+		config.Timeout = 30 * time.Second
+	}
+	if config.ContentType == "" {
+		config.ContentType = "application/json"
+	}
 
-	// Parse parameters
-	config.Parameters = parseKeyValuePairs(paramsFlag, "=")
+	// Load POST data from file if specified
+	if config.PostDataFile != "" && config.PostData == "" {
+		data, err := os.ReadFile(config.PostDataFile)
+		if err != nil {
+			fmt.Printf("Error reading POST data file: %v\n", err)
+			return
+		}
+		config.PostData = string(data)
+	}
 
+	printConfig(config)
+	fmt.Println("----------------------------------------")
+
+	result := runBenchmark(config)
+	printResults(result)
+}
+
+func loadConfigFromFile(filename string) (BenchmarkConfig, error) {
+	var config BenchmarkConfig
+
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return config, err
+	}
+
+	err = json.Unmarshal(data, &config)
+	if err != nil {
+		return config, err
+	}
+
+	// Convert timeout string to time.Duration
+	if config.TimeoutStr != "" {
+		config.Timeout, err = time.ParseDuration(config.TimeoutStr)
+		if err != nil {
+			return config, fmt.Errorf("invalid timeout format '%s': %w", config.TimeoutStr, err)
+		}
+	}
+
+	return config, nil
+}
+
+func printConfig(config BenchmarkConfig) {
 	fmt.Printf("Starting HTTP benchmark...\n")
 	fmt.Printf("URL: %s\n", config.URL)
+	fmt.Printf("Method: %s\n", config.Method)
 	fmt.Printf("Total requests: %d\n", config.TotalRequests)
 	fmt.Printf("Parallel requests: %d\n", config.ParallelCount)
 	fmt.Printf("Timeout: %v\n", config.Timeout)
+
+	if config.AuthToken != "" {
+		fmt.Printf("Auth token: [PROVIDED]\n")
+	}
 
 	if len(config.Headers) > 0 {
 		fmt.Printf("Custom headers: %d\n", len(config.Headers))
@@ -79,10 +271,17 @@ func main() {
 		}
 	}
 
-	fmt.Println("----------------------------------------")
+	if config.PostData != "" || config.PostDataFile != "" {
+		fmt.Printf("POST data: [PROVIDED]\n")
+		if config.PostDataFile != "" {
+			fmt.Printf("POST data file: %s\n", config.PostDataFile)
+		}
+		fmt.Printf("Content-Type: %s\n", config.ContentType)
+	}
 
-	result := runBenchmark(config)
-	printResults(result)
+	if config.DumpFailuresDir != "" {
+		fmt.Printf("Failure dump directory: %s\n", config.DumpFailuresDir)
+	}
 }
 
 func runBenchmark(config BenchmarkConfig) BenchmarkResult {
@@ -90,13 +289,16 @@ func runBenchmark(config BenchmarkConfig) BenchmarkResult {
 		Timeout: config.Timeout,
 	}
 
+	// Create failure dumper
+	failureDumper := NewFailureDumper(config.DumpFailuresDir)
+
 	// Channel to distribute work
-	workChan := make(chan int, config.TotalRequests)
+	workChan := make(chan WorkItem, config.TotalRequests)
 	resultsChan := make(chan RequestResult, config.TotalRequests)
 
-	// Fill work channel
+	// Fill work channel with test numbers
 	for i := 0; i < config.TotalRequests; i++ {
-		workChan <- i
+		workChan <- WorkItem{TestNumber: i}
 	}
 	close(workChan)
 
@@ -106,7 +308,7 @@ func runBenchmark(config BenchmarkConfig) BenchmarkResult {
 
 	for i := 0; i < config.ParallelCount; i++ {
 		wg.Add(1)
-		go worker(client, config, workChan, resultsChan, &wg)
+		go worker(client, config, i, workChan, resultsChan, failureDumper, &wg)
 	}
 
 	// Wait for all workers to complete
@@ -122,31 +324,39 @@ func runBenchmark(config BenchmarkConfig) BenchmarkResult {
 	}
 
 	totalDuration := time.Since(startTime)
+
+	// Print failure dump summary
+	if failureDumper.enabled {
+		fmt.Printf("\nFailure dump summary: %d unique failure types saved to %s\n",
+			failureDumper.failureCount, failureDumper.dumpDir)
+	}
+
 	return calculateBenchmarkResult(results, totalDuration)
 }
 
-type RequestResult struct {
-	Success      bool
-	ResponseTime time.Duration
-	StatusCode   int
-	Error        error
+type WorkItem struct {
+	TestNumber int
 }
 
-func worker(client *http.Client, config BenchmarkConfig, workChan <-chan int, resultsChan chan<- RequestResult, wg *sync.WaitGroup) {
+func worker(client *http.Client, config BenchmarkConfig, threadNumber int, workChan <-chan WorkItem, resultsChan chan<- RequestResult, failureDumper *FailureDumper, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	for range workChan {
-		result := makeRequest(client, config)
+	for workItem := range workChan {
+		result := makeRequest(client, config, workItem.TestNumber, threadNumber, failureDumper)
 		resultsChan <- result
 	}
 }
 
-func makeRequest(client *http.Client, config BenchmarkConfig) RequestResult {
+func makeRequest(client *http.Client, config BenchmarkConfig, testNumber, threadNumber int, failureDumper *FailureDumper) RequestResult {
+	// Replace variables in URL
+	targetURL := replaceVariables(config.URL, testNumber, threadNumber)
+
 	// Build URL with query parameters
-	targetURL := config.URL
 	if len(config.Parameters) > 0 {
-		u, err := url.Parse(config.URL)
+		u, err := url.Parse(targetURL)
 		if err != nil {
+			errorMsg := fmt.Sprintf("invalid URL: %v", err)
+			failureDumper.DumpFailure(0, "", errorMsg)
 			return RequestResult{
 				Success: false,
 				Error:   fmt.Errorf("invalid URL: %w", err),
@@ -155,14 +365,25 @@ func makeRequest(client *http.Client, config BenchmarkConfig) RequestResult {
 
 		query := u.Query()
 		for key, value := range config.Parameters {
-			query.Set(key, value)
+			replacedKey := replaceVariables(key, testNumber, threadNumber)
+			replacedValue := replaceVariables(value, testNumber, threadNumber)
+			query.Set(replacedKey, replacedValue)
 		}
 		u.RawQuery = query.Encode()
 		targetURL = u.String()
 	}
 
-	req, err := http.NewRequestWithContext(context.Background(), "GET", targetURL, nil)
+	// Prepare request body for POST/PUT requests
+	var requestBody io.Reader
+	if config.PostData != "" && (config.Method == "POST" || config.Method == "PUT" || config.Method == "PATCH") {
+		bodyData := replaceVariables(config.PostData, testNumber, threadNumber)
+		requestBody = strings.NewReader(bodyData)
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), config.Method, targetURL, requestBody)
 	if err != nil {
+		errorMsg := fmt.Sprintf("request creation failed: %v", err)
+		failureDumper.DumpFailure(0, "", errorMsg)
 		return RequestResult{
 			Success: false,
 			Error:   err,
@@ -171,12 +392,22 @@ func makeRequest(client *http.Client, config BenchmarkConfig) RequestResult {
 
 	// Add auth token if provided
 	if config.AuthToken != "" {
-		req.Header.Set("Authorization", "Bearer "+config.AuthToken)
+		authToken := replaceVariables(config.AuthToken, testNumber, threadNumber)
+		req.Header.Set("Authorization", "Bearer "+authToken)
 	}
 
-	// Add custom headers
+	// Add custom headers with variable replacement
 	for key, value := range config.Headers {
-		req.Header.Set(key, value)
+		replacedKey := replaceVariables(key, testNumber, threadNumber)
+		replacedValue := replaceVariables(value, testNumber, threadNumber)
+		req.Header.Set(replacedKey, replacedValue)
+	}
+
+	// Add Content-Type for POST requests (only if not overridden by custom headers)
+	if (config.Method == "POST" || config.Method == "PUT" || config.Method == "PATCH") && config.PostData != "" {
+		if _, exists := config.Headers["Content-Type"]; !exists {
+			req.Header.Set("Content-Type", config.ContentType)
+		}
 	}
 
 	// Add common headers (only if not overridden by custom headers)
@@ -189,6 +420,8 @@ func makeRequest(client *http.Client, config BenchmarkConfig) RequestResult {
 	responseTime := time.Since(startTime)
 
 	if err != nil {
+		errorMsg := fmt.Sprintf("request failed: %v", err)
+		failureDumper.DumpFailure(0, "", errorMsg)
 		return RequestResult{
 			Success:      false,
 			ResponseTime: responseTime,
@@ -197,16 +430,37 @@ func makeRequest(client *http.Client, config BenchmarkConfig) RequestResult {
 	}
 	defer resp.Body.Close()
 
-	// Read and discard response body to ensure complete request
-	_, _ = io.Copy(io.Discard, resp.Body)
+	// Read response body for potential failure dumping
+	responseBody, readErr := io.ReadAll(resp.Body)
+	responseBodyStr := ""
+	if readErr == nil {
+		responseBodyStr = string(responseBody)
+	} else {
+		responseBodyStr = fmt.Sprintf("Error reading response body: %v", readErr)
+	}
 
 	success := resp.StatusCode >= 200 && resp.StatusCode < 300
+
+	// Dump failure if request was not successful
+	if !success {
+		errorMsg := fmt.Sprintf("HTTP %d response", resp.StatusCode)
+		failureDumper.DumpFailure(resp.StatusCode, responseBodyStr, errorMsg)
+	}
 
 	return RequestResult{
 		Success:      success,
 		ResponseTime: responseTime,
 		StatusCode:   resp.StatusCode,
+		ResponseBody: responseBodyStr,
 	}
+}
+
+// replaceVariables replaces [test_number] and [thread_number] with actual values
+func replaceVariables(input string, testNumber, threadNumber int) string {
+	result := input
+	result = strings.ReplaceAll(result, "[test_number]", strconv.Itoa(testNumber))
+	result = strings.ReplaceAll(result, "[thread_number]", strconv.Itoa(threadNumber))
+	return result
 }
 
 func calculateBenchmarkResult(results []RequestResult, totalDuration time.Duration) BenchmarkResult {
