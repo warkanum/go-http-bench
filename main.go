@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -302,6 +303,11 @@ func runBenchmark(config BenchmarkConfig) BenchmarkResult {
 	}
 	close(workChan)
 
+	// Atomic counters for live stats
+	var completed, successful, failed int64
+	var lastErrCode int64
+	var lastErrBody atomic.Value // stores string
+
 	// Start workers
 	var wg sync.WaitGroup
 	startTime := time.Now()
@@ -317,21 +323,103 @@ func runBenchmark(config BenchmarkConfig) BenchmarkResult {
 		close(resultsChan)
 	}()
 
-	// Collect results
+	// Stats printer: update every second on the same line
+	stopStats := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				printProgress(config.TotalRequests, &completed, &successful, &failed, &lastErrCode, &lastErrBody, startTime)
+			case <-stopStats:
+				return
+			}
+		}
+	}()
+
+	// Collect results and update counters
 	var results []RequestResult
 	for result := range resultsChan {
 		results = append(results, result)
+		atomic.AddInt64(&completed, 1)
+		if result.Success {
+			atomic.AddInt64(&successful, 1)
+		} else {
+			atomic.AddInt64(&failed, 1)
+			if result.StatusCode != 0 {
+				atomic.StoreInt64(&lastErrCode, int64(result.StatusCode))
+			}
+			if result.ResponseBody != "" {
+				truncated := result.ResponseBody
+				if len(truncated) > 80 {
+					truncated = truncated[:80] + "..."
+				}
+				lastErrBody.Store(truncated)
+			} else if result.Error != nil {
+				errStr := result.Error.Error()
+				if len(errStr) > 80 {
+					errStr = errStr[:80] + "..."
+				}
+				lastErrBody.Store(errStr)
+			}
+		}
 	}
+
+	close(stopStats)
 
 	totalDuration := time.Since(startTime)
 
 	// Print failure dump summary
 	if failureDumper.enabled {
-		fmt.Printf("\nFailure dump summary: %d unique failure types saved to %s\n",
+		fmt.Printf("Failure dump summary: %d unique failure types saved to %s\n",
 			failureDumper.failureCount, failureDumper.dumpDir)
 	}
 
 	return calculateBenchmarkResult(results, totalDuration)
+}
+
+func printProgress(total int, completed, successful, failed *int64, lastErrCode *int64, lastErrBody *atomic.Value, startTime time.Time) {
+	c := atomic.LoadInt64(completed)
+	s := atomic.LoadInt64(successful)
+	f := atomic.LoadInt64(failed)
+	errCode := atomic.LoadInt64(lastErrCode)
+	elapsed := time.Since(startTime)
+	remaining := int64(total) - c
+
+	var reqPerSec float64
+	if elapsed.Seconds() > 0 {
+		reqPerSec = float64(c) / elapsed.Seconds()
+	}
+
+	var eta string
+	if reqPerSec > 0 && remaining > 0 {
+		etaDur := time.Duration(float64(remaining)/reqPerSec*float64(time.Second)).Round(time.Millisecond)
+		eta = etaDur.String()
+	} else if remaining <= 0 {
+		eta = "done"
+	} else {
+		eta = "N/A"
+	}
+
+	errSummary := ""
+	if f > 0 {
+		body := ""
+		if v := lastErrBody.Load(); v != nil {
+			body = v.(string)
+		}
+		if errCode != 0 {
+			errSummary = fmt.Sprintf(" | Last err: HTTP %d: %s", errCode, body)
+		} else {
+			errSummary = fmt.Sprintf(" | Last err: %s", body)
+		}
+		if len(errSummary) > 60 {
+			errSummary = errSummary[:60] + "..."
+		}
+	}
+
+	fmt.Printf("Progress: %d/%d | OK: %d | Fail: %d | %.1f req/s | Elapsed: %.1fs | ETA: %s%s\n",
+		c, total, s, f, reqPerSec, elapsed.Seconds(), eta, errSummary)
 }
 
 type WorkItem struct {

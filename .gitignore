@@ -25,3 +25,8 @@ go.work.sum
 .env
 ./bin
 ./failures
+
+example-configs/10.*
+example-configs/utils*
+bin/failures/*
+/go-http-bench
