@@ -35,11 +35,11 @@ mv benchmark-linux-amd64 /usr/local/bin/benchmark
 git clone https://github.com/warkanum/go-http-bench.git
 cd http-benchmark
 
-# Build the binary
-go build -o benchmark main.go
+# Build the binary (outputs to bin/go-http-bench)
+make build
 
 # Optional: Install globally
-sudo mv benchmark /usr/local/bin/
+sudo mv bin/go-http-bench /usr/local/bin/
 ```
 
 ### Option 3: Install with Go
@@ -91,6 +91,7 @@ go install github.com/warkanum/go-http-bench@latest
 | `-post-file` | POST data file | - | `-post-file data.json` |
 | `-content-type` | Content-Type header | `application/json` | `-content-type "text/xml"` |
 | `-dump-failures` | Failure dump directory | - | `-dump-failures "./failures"` |
+| `-insecure` | Skip TLS certificate verification (self-signed certs, IP hosts without SANs) | `false` | `-insecure` |
 
 ### JSON Configuration
 
@@ -106,6 +107,7 @@ Create a `config.json` file:
     "auth_token": "your-bearer-token",
     "content_type": "application/json",
     "dump_failures_dir": "./failures",
+    "insecure": false,
     "headers": {
         "Accept": "application/json",
         "X-Request-ID": "bench-[test_number]-[thread_number]"
@@ -305,11 +307,17 @@ cd http-benchmark
 go mod tidy
 
 # Run tests
-go test ./...
+make test
 
-# Build
-go build -o benchmark main.go
+# Build (outputs to bin/go-http-bench)
+make build
 ```
+
+## ⚠️ Disclaimer
+
+This tool is intended purely for benchmarking and authorized security testing. You may not use it to attack any website or service. Only test systems you own or have explicit permission to test.
+
+The author takes no responsibility for how this tool is used. You are solely responsible for your actions and for complying with all applicable laws and terms of service.
 
 ## 📝 License
 

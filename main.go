@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/md5"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -33,6 +34,7 @@ type BenchmarkConfig struct {
 	PostData        string            `json:"post_data"`         // Direct POST data
 	ContentType     string            `json:"content_type"`      // Content-Type for POST requests
 	DumpFailuresDir string            `json:"dump_failures_dir"` // Directory to dump failure responses
+	Insecure        bool              `json:"insecure"`          // Skip TLS certificate verification
 }
 
 type BenchmarkResult struct {
@@ -133,6 +135,7 @@ This is a unique failure response that hasn't been seen before in this benchmark
 func main() {
 	var config BenchmarkConfig
 	var headersFlag, paramsFlag, configFile string
+	var insecureFlag bool
 
 	// Command line flags (for backward compatibility)
 	flag.StringVar(&configFile, "config", "", "Configuration file (JSON format)")
@@ -148,6 +151,7 @@ func main() {
 	flag.StringVar(&config.PostDataFile, "post-file", "", "File containing POST data")
 	flag.StringVar(&config.PostData, "post-data", "", "POST data as string")
 	flag.StringVar(&config.ContentType, "content-type", "application/json", "Content-Type for POST requests")
+	flag.BoolVar(&insecureFlag, "insecure", false, "Skip TLS certificate verification (allow self-signed/invalid certs)")
 	flag.Parse()
 
 	// Load config from file if specified
@@ -161,6 +165,9 @@ func main() {
 	}
 
 	// Command line flags override config file values
+	if insecureFlag {
+		config.Insecure = true
+	}
 	if headersFlag != "" {
 		if config.Headers == nil {
 			config.Headers = make(map[string]string)
@@ -286,8 +293,13 @@ func printConfig(config BenchmarkConfig) {
 }
 
 func runBenchmark(config BenchmarkConfig) BenchmarkResult {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if config.Insecure {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
 	client := &http.Client{
-		Timeout: config.Timeout,
+		Timeout:   config.Timeout,
+		Transport: transport,
 	}
 
 	// Create failure dumper
