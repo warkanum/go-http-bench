@@ -406,7 +406,7 @@ func printProgress(total int, completed, successful, failed *int64, lastErrCode 
 
 	var eta string
 	if reqPerSec > 0 && remaining > 0 {
-		etaDur := time.Duration(float64(remaining)/reqPerSec*float64(time.Second)).Round(time.Millisecond)
+		etaDur := time.Duration(float64(remaining) / reqPerSec * float64(time.Second)).Round(time.Millisecond)
 		eta = etaDur.String()
 	} else if remaining <= 0 {
 		eta = "done"
@@ -528,7 +528,7 @@ func makeRequest(client *http.Client, config BenchmarkConfig, testNumber, thread
 			Error:        err,
 		}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// Read response body for potential failure dumping
 	responseBody, readErr := io.ReadAll(resp.Body)
